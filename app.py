@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -7,14 +8,23 @@ st.set_page_config(page_title="SQOODS AI", page_icon="⚡", layout="centered")
 st.title("⚡ SQOODS - Quantum Neural Core")
 st.caption("Live Search Grounding Enabled")
 
-# Pull API key securely from Streamlit secrets
+# Safely fetch API key from Streamlit Secrets or environment
+api_key = None
 try:
-    API_KEY = st.secrets["GEMINI_API_KEY"]
-    client = genai.Client(api_key=API_KEY)
-except Exception as e:
-    st.error("API Key missing! Please set GEMINI_API_KEY in your Streamlit app settings.")
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    pass
+
+if not api_key:
+    api_key = os.environ.get("GEMINI_API_KEY")
+
+if not api_key:
+    st.error("🚨 API Key not found! Please configure `GEMINI_API_KEY` in Streamlit Cloud Settings -> Secrets.")
     st.stop()
 
+# Initialize Gemini Client
+client = genai.Client(api_key=api_key)
 MODEL_ID = "gemini-2.5-flash"
 
 # Maintain chat history in session state
