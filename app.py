@@ -7,9 +7,14 @@ st.set_page_config(page_title="SQOODS AI", page_icon="⚡", layout="centered")
 st.title("⚡ SQOODS - Quantum Neural Core")
 st.caption("Live Search Grounding Enabled")
 
-# Initialize Gemini Client using your API key
-API_KEY = "AQ.Ab8RN6KfPhIn4UbpWtLVXCy3QfDNFf6DnBCXdmY15B6aC2WcVg"
-client = genai.Client(api_key=API_KEY)
+# Pull API key securely from Streamlit secrets
+try:
+    API_KEY = st.secrets["GEMINI_API_KEY"]
+    client = genai.Client(api_key=API_KEY)
+except Exception as e:
+    st.error("API Key missing! Please set GEMINI_API_KEY in your Streamlit app settings.")
+    st.stop()
+
 MODEL_ID = "gemini-2.5-flash"
 
 # Maintain chat history in session state
