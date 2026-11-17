@@ -1,4 +1,5 @@
 import os
+import re
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -8,7 +9,7 @@ st.set_page_config(page_title="SQOODS AI", page_icon="⚡", layout="centered")
 st.title("⚡ SQOODS - Quantum Neural Core")
 st.caption("Live Search Grounding Enabled")
 
-# Safely fetch and clean API key
+# Fetch key from Streamlit Secrets or environment
 raw_key = None
 try:
     if "GEMINI_API_KEY" in st.secrets:
@@ -19,14 +20,21 @@ except Exception:
 if not raw_key:
     raw_key = os.environ.get("GEMINI_API_KEY", "")
 
-# Clean up any accidental spaces or wrapping quotes
-api_key = str(raw_key).strip().strip("'").strip('"')
+# BULLETPROOF FIX: Automatically remove all newlines, spaces, and quotes 
+# so it works no matter how it was pasted into the secrets box!
+cleaned_val = str(raw_key).replace("\n", "").replace("\r", "").replace(" ", "").strip("'").strip('"')
 
-if not api_key or len(api_key) < 10:
-    st.error("🚨 API Key not found or invalid format in Streamlit Secrets!")
+# If the key has the TOML variable name included by accident, strip it out
+if "=" in cleaned_val:
+    cleaned_val = cleaned_val.split("=")[-1]
+
+api_key = cleaned_val.strip()
+
+if not api_key:
+    st.error("🚨 API Key not found! Please check your Streamlit Secrets.")
     st.stop()
 
-# Initialize Client strictly for Developer API
+# Initialize Client
 client = genai.Client(api_key=api_key)
 MODEL_ID = "gemini-2.5-flash"
 
