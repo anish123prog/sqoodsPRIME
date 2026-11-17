@@ -20,11 +20,9 @@ except Exception:
 if not raw_key:
     raw_key = os.environ.get("GEMINI_API_KEY", "")
 
-# BULLETPROOF FIX: Automatically remove all newlines, spaces, and quotes 
-# so it works no matter how it was pasted into the secrets box!
+# Clean up any newlines, spaces, or extra quotes
 cleaned_val = str(raw_key).replace("\n", "").replace("\r", "").replace(" ", "").strip("'").strip('"')
 
-# If the key has the TOML variable name included by accident, strip it out
 if "=" in cleaned_val:
     cleaned_val = cleaned_val.split("=")[-1]
 
@@ -34,8 +32,8 @@ if not api_key:
     st.error("🚨 API Key not found! Please check your Streamlit Secrets.")
     st.stop()
 
-# Initialize Client
-client = genai.Client(api_key=api_key)
+# Initialize Client with v1beta to support system instructions
+client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
 MODEL_ID = "gemini-2.5-flash"
 
 # Maintain chat history
