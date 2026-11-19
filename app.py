@@ -26,10 +26,25 @@ st.sidebar.divider()
 st.sidebar.subheader("💬 Your Saved Chats")
 
 for idx, session in enumerate(st.session_state.sessions):
+    col_chat, col_del = st.sidebar.columns([4, 1])
+    
     button_label = f"📌 {session['title']}" if idx == st.session_state.current_session_idx else session['title']
-    if st.sidebar.button(button_label, key=f"chat_btn_{idx}", use_container_width=True):
-        st.session_state.current_session_idx = idx
-        st.rerun()
+    with col_chat:
+        if st.button(button_label, key=f"chat_btn_{idx}", use_container_width=True):
+            st.session_state.current_session_idx = idx
+            st.rerun()
+            
+    with col_del:
+        if st.button("🗑️", key=f"del_btn_{idx}", help="Delete this chat", use_container_width=True):
+            st.session_state.sessions.pop(idx)
+            # If all chats were deleted, create a fresh empty one
+            if len(st.session_state.sessions) == 0:
+                st.session_state.sessions = [{"title": "New Chat", "messages": []}]
+                st.session_state.current_session_idx = 0
+            # Adjust active index safely if needed
+            elif st.session_state.current_session_idx >= len(st.session_state.sessions):
+                st.session_state.current_session_idx = len(st.session_state.sessions) - 1
+            st.rerun()
 
 # --- 2. API KEY SETUP ---
 raw_key = None
@@ -74,7 +89,6 @@ for i, message in enumerate(messages):
         st.markdown(message["content"])
         
         if message["role"] == "assistant":
-            # Safely encode text for JavaScript and URLs
             js_safe_text = json.dumps(message["content"])
             encoded_text = urllib.parse.quote(message["content"])
             wa_url = f"https://api.whatsapp.com/send?text={encoded_text}"
