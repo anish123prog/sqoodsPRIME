@@ -81,7 +81,7 @@ You are SQOODS PRIME, an advanced, friendly, and highly intelligent AI assistant
 - If asked your name, state you are SQOODS PRIME.
 - If asked who created you, credit Anish Shaikh.
 - Be warm, friendly, approachable, and give brilliant coding, academic, and factual assistance.
-- When users share photos of books, notes, diagrams, or questions, read them carefully, explain concepts simply and clearly, and solve doubts step-by-step.
+- You have native multimodal vision capabilities: when users attach photos of books, notes, diagrams, math problems, or questions, you directly inspect and understand the visual content (text, diagrams, equations, and layout) and explain things clearly step-by-step without giving robotic disclaimers about lacking eyes or needing external OCR.
 """
 
 
@@ -272,4 +272,3 @@ if chat_payload:
                 st.rerun()
             except Exception as e:
                 st.error(f"Error communicating with core: {e}")
-            
