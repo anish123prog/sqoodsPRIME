@@ -1,6 +1,7 @@
 import io
 import os
 import json
+import time
 import urllib.parse
 from PIL import Image
 import streamlit as st
@@ -69,7 +70,11 @@ if not api_key:
     st.stop()
 
 client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
-MODEL_ID = "gemini-2.5-flash"
+MODEL_CANDIDATES = [
+    "gemini-2.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+]
 
 SYSTEM_PROMPT = """
 You are SQOODS PRIME, an advanced, friendly, and highly intelligent AI assistant developed by Anish Shaikh.
@@ -96,6 +101,39 @@ def prepare_image_part(img_item: dict) -> types.Part:
         return types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
 
 
+def generate_with_fallback(contents_payload):
+    """Retry on transient 503/high-demand errors and fall back across available models."""
+    last_error = None
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=[{"google_search": {}}],
+    )
+
+    for model_name in MODEL_CANDIDATES:
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents_payload,
+                    config=config,
+                )
+            except Exception as err:
+                last_error = err
+                err_str = str(err)
+                is_transient = any(
+                    token in err_str
+                    for token in ("503", "UNAVAILABLE", "high demand", "429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND")
+                )
+                if not is_transient:
+                    raise
+                if attempt == 0 and ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str):
+                    time.sleep(1.5)
+                    continue
+                break
+
+    raise last_error
+
+
 # --- 3. MAIN CHAT INTERFACE ---
 st.title("⚡ SQOODS PRIME")
 st.caption("Live Search Grounding • Multi-Photo Doubts • Multi-Chat • Voice • Copy & Share")
@@ -106,7 +144,6 @@ messages = current_session["messages"]
 # Display prior chat history
 for i, message in enumerate(messages):
     with st.chat_message(message["role"]):
-        # Render any images attached to this message
         if message.get("images"):
             img_cols = st.columns(min(len(message["images"]), 3))
             for idx_img, img_data in enumerate(message["images"]):
@@ -211,14 +248,13 @@ if chat_payload:
         st.markdown(display_text)
 
     with st.chat_message("assistant"):
-        with st.spinner("SQOODS PRIME is reading your photos and thinking..."):
+        with st.spinner("SQOODS PRIME is thinking..."):
             try:
                 gemini_contents = []
                 for idx_m, msg in enumerate(messages):
                     role = "user" if msg["role"] == "user" else "model"
                     parts = []
 
-                    # Attach images on the latest user turn so they are analyzed directly
                     if msg["role"] == "user" and idx_m == len(messages) - 1 and msg.get("images"):
                         for img_item in msg["images"]:
                             parts.append(prepare_image_part(img_item))
@@ -228,14 +264,7 @@ if chat_payload:
 
                     gemini_contents.append(types.Content(role=role, parts=parts))
 
-                response = client.models.generate_content(
-                    model=MODEL_ID,
-                    contents=gemini_contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        tools=[{"google_search": {}}]
-                    )
-                )
+                response = generate_with_fallback(gemini_contents)
                 bot_reply = response.text
                 st.markdown(bot_reply)
                 messages.append({"role": "assistant", "content": bot_reply})
@@ -243,3 +272,4 @@ if chat_payload:
                 st.rerun()
             except Exception as e:
                 st.error(f"Error communicating with core: {e}")
+            
