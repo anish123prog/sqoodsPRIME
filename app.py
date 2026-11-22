@@ -6,23 +6,18 @@ import random
 import sqlite3
 import hashlib
 import urllib.parse
+import requests
 from PIL import Image
 import streamlit as st
 import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-from huggingface_hub import InferenceClient
 
 st.set_page_config(page_title="SQOODS PRIME", page_icon="⚡", layout="centered")
 
 MAX_IMAGE_SIDE = 1280
 DB_PATH = "sqoods_prime.db"
-HF_IMAGE_MODELS = [
-    "black-forest-labs/FLUX.1-schnell",
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    "black-forest-labs/FLUX.1-dev",
-]
 
 # --- CUSTOM MOBILE & BRAND POLISH ---
 st.markdown(
@@ -303,9 +298,9 @@ use_search = st.sidebar.toggle(
 )
 
 image_gen_mode = st.sidebar.toggle(
-    "🎨 Image Gen Mode (HF)",
+    "🎨 Image Gen Mode",
     value=False,
-    help="Generate AI images via Hugging Face, or start any prompt with /image.",
+    help="Generate AI images, or start any prompt with /image.",
 )
 
 col_new, col_clear = st.sidebar.columns(2)
@@ -353,7 +348,6 @@ for idx, session in enumerate(st.session_state.sessions):
 
 # --- 2. API KEY SETUP ---
 api_key = get_clean_secret("GEMINI_API_KEY")
-hf_token = get_clean_secret("HF_TOKEN")
 
 if not api_key:
     st.error("🚨 GEMINI_API_KEY not found! Please check your Streamlit Secrets.")
@@ -399,20 +393,17 @@ def prepare_image_part(img_item: dict) -> types.Part:
         return types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
 
 
-def generate_hf_image(prompt: str, token: str) -> bytes:
-    """Auto-route across active Hugging Face Inference Providers and return PNG bytes."""
-    hf_client = InferenceClient(provider="auto", api_key=token)
-    errors = []
-    for model_id in HF_IMAGE_MODELS:
-        try:
-            pil_img = hf_client.text_to_image(prompt, model=model_id)
-            buf = io.BytesIO()
-            pil_img.save(buf, format="PNG")
-            return buf.getvalue()
-        except Exception as err:
-            errors.append(f"{model_id}: {err}")
-            continue
-    raise RuntimeError(" | ".join(errors))
+def generate_free_image(prompt: str) -> bytes:
+    """Generate an image via Pollinations.ai free endpoint and return PNG bytes."""
+    encoded_prompt = urllib.parse.quote(prompt)
+    seed = random.randint(1, 999999)
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&seed={seed}&nologo=true"
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    pil_img = Image.open(io.BytesIO(resp.content))
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def generate_with_resilience(contents_payload, enable_search: bool = True, max_retries: int = 3):
@@ -473,7 +464,7 @@ def build_notes_markdown(session_data: dict) -> str:
 title_col, dl_col = st.columns([5, 1])
 with title_col:
     st.title("⚡ SQOODS PRIME")
-    st.caption("Live Search • Multi-Photo Doubts • HF Image Gen • Account Saved Chats • Voice")
+    st.caption("Live Search • Multi-Photo Doubts • AI Image Gen • Account Saved Chats • Voice")
 
 current_session = st.session_state.sessions[st.session_state.current_session_idx]
 messages = current_session["messages"]
@@ -675,14 +666,12 @@ if raw_text or uploaded_files:
 
     with st.chat_message("assistant"):
         if is_image_request:
-            if not hf_token:
-                st.warning("🎨 **HF_TOKEN Missing:** Add `HF_TOKEN` in your Streamlit Secrets to enable image generation.")
-            elif not clean_img_prompt:
+            if not clean_img_prompt:
                 st.warning("Please enter an image prompt after `/image`.")
             else:
-                with st.spinner("🎨 Generating image with Hugging Face..."):
+                with st.spinner("🎨 Generating image..."):
                     try:
-                        gen_bytes = generate_hf_image(clean_img_prompt, hf_token)
+                        gen_bytes = generate_free_image(clean_img_prompt)
                         gen_item = {
                             "name": "sqoods_generated.png",
                             "bytes": gen_bytes,
@@ -705,14 +694,7 @@ if raw_text or uploaded_files:
                         st.session_state.input_counter += 1
                         st.rerun()
                     except Exception as e:
-                        err_msg = str(e)
-                        if "403" in err_msg or "permissions" in err_msg.lower():
-                            st.error(
-                                "🔑 **HF Token Permission Error:** Go to `huggingface.co/settings/tokens`, "
-                                "enable **Make calls to Inference Providers** on your token, and try again."
-                            )
-                        else:
-                            st.error(f"Image generation error: {e}")
+                        st.error(f"Image generation error: {e}")
         else:
             with st.spinner("SQOODS PRIME is thinking..."):
                 try:
