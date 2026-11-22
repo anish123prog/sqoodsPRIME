@@ -18,7 +18,11 @@ st.set_page_config(page_title="SQOODS PRIME", page_icon="⚡", layout="centered"
 
 MAX_IMAGE_SIDE = 1280
 DB_PATH = "sqoods_prime.db"
-HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
+HF_IMAGE_MODELS = [
+    "black-forest-labs/FLUX.1-schnell",
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    "black-forest-labs/FLUX.1-dev",
+]
 
 # --- CUSTOM MOBILE & BRAND POLISH ---
 st.markdown(
@@ -396,12 +400,19 @@ def prepare_image_part(img_item: dict) -> types.Part:
 
 
 def generate_hf_image(prompt: str, token: str) -> bytes:
-    """Generate an image using Hugging Face InferenceClient and return PNG bytes."""
-    hf_client = InferenceClient(provider="hf-inference", api_key=token)
-    pil_img = hf_client.text_to_image(prompt, model=HF_IMAGE_MODEL)
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    return buf.getvalue()
+    """Auto-route across active Hugging Face Inference Providers and return PNG bytes."""
+    hf_client = InferenceClient(provider="auto", api_key=token)
+    errors = []
+    for model_id in HF_IMAGE_MODELS:
+        try:
+            pil_img = hf_client.text_to_image(prompt, model=model_id)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as err:
+            errors.append(f"{model_id}: {err}")
+            continue
+    raise RuntimeError(" | ".join(errors))
 
 
 def generate_with_resilience(contents_payload, enable_search: bool = True, max_retries: int = 3):
@@ -694,7 +705,14 @@ if raw_text or uploaded_files:
                         st.session_state.input_counter += 1
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Image generation error: {e}")
+                        err_msg = str(e)
+                        if "403" in err_msg or "permissions" in err_msg.lower():
+                            st.error(
+                                "🔑 **HF Token Permission Error:** Go to `huggingface.co/settings/tokens`, "
+                                "enable **Make calls to Inference Providers** on your token, and try again."
+                            )
+                        else:
+                            st.error(f"Image generation error: {e}")
         else:
             with st.spinner("SQOODS PRIME is thinking..."):
                 try:
