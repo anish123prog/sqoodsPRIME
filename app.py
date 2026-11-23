@@ -1,9 +1,7 @@
 import io
 import os
-import re
 import json
 import time
-import base64
 import random
 import sqlite3
 import hashlib
@@ -14,21 +12,11 @@ import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-from huggingface_hub import InferenceClient
 
 st.set_page_config(page_title="SQOODS PRIME", page_icon=":material/bolt:", layout="centered")
 
 MAX_IMAGE_SIDE = 1280
 DB_PATH = "sqoods_prime.db"
-HF_IMAGE_MODELS = [
-    "black-forest-labs/FLUX.1-schnell",
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    "black-forest-labs/FLUX.1-dev",
-]
-GEMINI_IMAGE_MODELS = [
-    "gemini-2.5-flash-image",
-    "gemini-2.0-flash-exp-image-generation",
-]
 
 # --- SPACIOUS EXECUTIVE UI POLISH ---
 st.markdown(
@@ -473,7 +461,6 @@ for idx, session in enumerate(st.session_state.sessions):
 
 # --- 2. API KEY SETUP ---
 api_key = get_clean_secret("GEMINI_API_KEY")
-hf_token = get_clean_secret("HF_TOKEN")
 
 if not api_key:
     st.error("GEMINI_API_KEY missing in Streamlit Secrets.")
@@ -489,37 +476,6 @@ You are SQOODS PRIME, an intelligent AI assistant developed by Anish Shaikh.
 - Give clear, accurate, and well-structured technical, academic, and general answers.
 - When users attach images, inspect them directly and explain clearly without disclaimers about lacking eyes or needing OCR.
 """
-
-
-def extract_image_request(text: str, has_uploaded_images: bool) -> tuple[bool, str]:
-    """Detect image requests in user messages and refine short prompts cleanly."""
-    if has_uploaded_images or not text:
-        return False, ""
-
-    stripped = text.strip()
-    raw_prompt = ""
-    if stripped.lower().startswith("/image "):
-        raw_prompt = stripped[7:].strip()
-    else:
-        match = re.match(
-            r"^(?:please\s+)?(?:can\s+you\s+)?(?:generate|create|make|draw|render|design|show(?:\s+me)?)\s+(?:an?\s+)?(?:image|picture|photo|illustration|artwork|wallpaper|drawing|logo)\s+(?:of\s+|for\s+|showing\s+|about\s+)?(.+)$",
-            stripped,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            raw_prompt = match.group(1).strip()
-
-    if not raw_prompt:
-        return False, ""
-
-    if raw_prompt.lower().startswith("/testimg"):
-        return True, "/testimg"
-
-    if len(raw_prompt.split()) <= 4:
-        refined = f"{raw_prompt}, high detail, crisp lighting, clean composition"
-    else:
-        refined = raw_prompt
-    return True, refined
 
 
 def prepare_image_part(img_item: dict) -> types.Part:
@@ -548,82 +504,6 @@ def prepare_image_part(img_item: dict) -> types.Part:
         return types.Part.from_bytes(data=buf.getvalue(), mime_type=f"image/{fmt.lower()}")
     except Exception:
         return types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
-
-
-def generate_gemini_image(prompt: str) -> bytes:
-    """Fallback image generator using Gemini image-capable models."""
-    last_err = None
-    for img_model in GEMINI_IMAGE_MODELS:
-        try:
-            resp = client.models.generate_content(
-                model=img_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE", "TEXT"],
-                ),
-            )
-            parts = getattr(resp, "parts", None)
-            if not parts:
-                candidates = getattr(resp, "candidates", None) or []
-                parts = []
-                for cand in candidates:
-                    content = getattr(cand, "content", None)
-                    parts.extend(getattr(content, "parts", None) or [])
-            for part in parts:
-                inline = getattr(part, "inline_data", None)
-                if inline and getattr(inline, "data", None):
-                    raw = inline.data
-                    if isinstance(raw, bytes):
-                        return raw
-                    if isinstance(raw, str):
-                        return base64.b64decode(raw)
-        except Exception as err:
-            last_err = err
-            continue
-    raise RuntimeError(f"Gemini image fallback unavailable: {last_err}")
-
-
-def generate_image_with_resilience(prompt: str, token: str) -> tuple[bytes, str]:
-    """Generate via /testimg, Hugging Face InferenceClient, or Gemini image fallback."""
-    if prompt.lower().startswith("/testimg"):
-        test_img = Image.new("RGB", (512, 512), color=(18, 18, 24))
-        pixels = test_img.load()
-        for y in range(512):
-            for x in range(512):
-                if (x // 32 + y // 32) % 2 == 0:
-                    pixels[x, y] = (255, 115, 0)
-        buf = io.BytesIO()
-        test_img.save(buf, format="PNG")
-        return buf.getvalue(), "local"
-
-    hf_error = None
-    if token:
-        hf_client = InferenceClient(provider="auto", api_key=token, timeout=60)
-        errors = []
-        for model_id in HF_IMAGE_MODELS:
-            try:
-                pil_img = hf_client.text_to_image(prompt, model=model_id)
-                buf = io.BytesIO()
-                pil_img.save(buf, format="PNG")
-                return buf.getvalue(), model_id.split("/")[-1]
-            except Exception as err:
-                err_str = str(err)
-                if "401" in err_str:
-                    hf_error = RuntimeError("Invalid HF_TOKEN.")
-                    break
-                if "403" in err_str:
-                    hf_error = RuntimeError("HF_TOKEN lacks Inference Providers permission.")
-                    break
-                errors.append(f"{model_id.split('/')[-1]}: {err_str[:80]}")
-        if not hf_error and errors:
-            hf_error = RuntimeError(" | ".join(errors))
-    else:
-        hf_error = RuntimeError("HF_TOKEN not configured")
-
-    try:
-        return generate_gemini_image(prompt), "gemini-image"
-    except Exception:
-        raise hf_error
 
 
 def build_token_efficient_contents(messages: list, effective_prompt: str) -> list:
@@ -662,7 +542,7 @@ def build_token_efficient_contents(messages: list, effective_prompt: str) -> lis
                     parts.append(prepare_image_part(img_item))
             parts.append(types.Part.from_text(text=effective_prompt))
         else:
-            text_val = msg.get("content") or ("[Generated image]" if msg.get("images") else "")
+            text_val = msg.get("content") or ("[Attached image]" if msg.get("images") else "")
             if text_val:
                 parts.append(types.Part.from_text(text=text_val))
 
@@ -774,15 +654,6 @@ for i, message in enumerate(messages):
                 for idx_img, img_data in enumerate(valid_imgs):
                     with img_cols[idx_img % len(img_cols)]:
                         st.image(img_data["bytes"], use_container_width=True)
-                        if message["role"] == "assistant":
-                            st.download_button(
-                                label=":material/download:",
-                                data=img_data["bytes"],
-                                file_name=img_data.get("name", f"sqoods_image_{i}.png"),
-                                mime=img_data.get("mime_type", "image/png"),
-                                key=f"dl_gen_img_{i}_{idx_img}",
-                                help="Download Image",
-                            )
 
         if message.get("content"):
             st.markdown(message["content"])
@@ -946,8 +817,6 @@ if raw_text or uploaded_files:
             "mime_type": f.type or "image/jpeg",
         })
 
-    is_image_request, clean_img_prompt = extract_image_request(raw_text, bool(stored_images))
-
     display_text = raw_text if raw_text else "Analyze attached images."
     effective_prompt = (
         raw_text
@@ -974,56 +843,28 @@ if raw_text or uploaded_files:
         st.markdown(display_text)
 
     with st.chat_message("assistant"):
-        if is_image_request:
-            if not clean_img_prompt:
-                st.warning("Provide an image description.")
-            else:
-                with st.spinner("Generating image..."):
-                    try:
-                        gen_bytes, _source = generate_image_with_resilience(clean_img_prompt, hf_token)
-                        gen_item = {
-                            "name": "sqoods_generated.png",
-                            "bytes": gen_bytes,
-                            "mime_type": "image/png",
-                        }
-                        st.image(gen_bytes, use_container_width=True)
-                        messages.append({
-                            "role": "assistant",
-                            "content": "",
-                            "images": [gen_item],
-                        })
-                        save_user_chats(
-                            st.session_state.auth_user,
-                            st.session_state.sessions,
-                            st.session_state.current_session_idx,
-                        )
-                        st.session_state.input_counter += 1
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Image generation failed: {e}")
-        else:
-            with st.spinner("Processing..."):
-                try:
-                    gemini_contents = build_token_efficient_contents(messages, effective_prompt)
-                    response = generate_with_resilience(gemini_contents, enable_search=use_search)
-                    bot_reply = response.text
-                    st.markdown(bot_reply)
-                    messages.append({"role": "assistant", "content": bot_reply})
-                    save_user_chats(
-                        st.session_state.auth_user,
-                        st.session_state.sessions,
-                        st.session_state.current_session_idx,
-                    )
-                    st.session_state.input_counter += 1
-                    st.rerun()
-                except APIError as e:
-                    if e.code == 429:
-                        st.warning("Rate limit reached. Try again shortly.")
-                    else:
-                        st.error(f"Error: {e}")
-                except Exception as e:
-                    err_text = str(e)
-                    if "429" in err_text or "RESOURCE_EXHAUSTED" in err_text:
-                        st.warning("Rate limit reached. Try again shortly.")
-                    else:
-                        st.error(f"Error: {e}")
+        with st.spinner("Processing..."):
+            try:
+                gemini_contents = build_token_efficient_contents(messages, effective_prompt)
+                response = generate_with_resilience(gemini_contents, enable_search=use_search)
+                bot_reply = response.text
+                st.markdown(bot_reply)
+                messages.append({"role": "assistant", "content": bot_reply})
+                save_user_chats(
+                    st.session_state.auth_user,
+                    st.session_state.sessions,
+                    st.session_state.current_session_idx,
+                )
+                st.session_state.input_counter += 1
+                st.rerun()
+            except APIError as e:
+                if e.code == 429:
+                    st.warning("Rate limit reached. Try again shortly.")
+                else:
+                    st.error(f"Error: {e}")
+            except Exception as e:
+                err_text = str(e)
+                if "429" in err_text or "RESOURCE_EXHAUSTED" in err_text:
+                    st.warning("Rate limit reached. Try again shortly.")
+                else:
+                    st.error(f"Error: {e}")
