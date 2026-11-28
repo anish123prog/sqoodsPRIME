@@ -6,6 +6,7 @@ import random
 import sqlite3
 import hashlib
 import urllib.parse
+from datetime import datetime
 from PIL import Image
 import streamlit as st
 import streamlit.components.v1 as components
@@ -16,7 +17,27 @@ from google.genai.errors import APIError
 st.set_page_config(page_title="SQOODS PRIME", page_icon=":material/bolt:", layout="centered")
 
 MAX_IMAGE_SIDE = 1280
+DAILY_USER_LIMIT = 50
 DB_PATH = "sqoods_prime.db"
+
+STUDY_MODES = {
+    "Friendly & Deep": (
+        "Maintain a warm, friendly, encouraging mentor tone while providing scientifically accurate, "
+        "well-structured explanations with clear intuition, mechanisms, and key takeaways."
+    ),
+    "Professor Rigor": (
+        "Respond like an approachable university professor: keep a welcoming tone, but use rigorous "
+        "scientific/academic terminology, formal definitions, equations/derivations in LaTeX, edge cases, "
+        "and empirical or theoretical justification."
+    ),
+    "Step-by-Step Tutor": (
+        "Act as a patient, encouraging tutor: break complex problems or concepts into numbered steps, "
+        "explain why each step matters, and check understanding with a brief practice thought."
+    ),
+    "Quick Summary": (
+        "Give a friendly, crisp, high-signal summary with bullet points and essential formulas or conclusions."
+    ),
+}
 
 # --- SPACIOUS EXECUTIVE UI POLISH ---
 st.markdown(
@@ -56,7 +77,7 @@ st.markdown(
 
 
 # --- SECRET LOADER HELPER ---
-def get_clean_secret(name: str) -> str:
+def get_clean_secret(name: str, strip_spaces: bool = True) -> str:
     raw = None
     try:
         if name in st.secrets:
@@ -65,10 +86,15 @@ def get_clean_secret(name: str) -> str:
         pass
     if not raw:
         raw = os.environ.get(name, "")
-    cleaned = str(raw).replace("\n", "").replace("\r", "").replace(" ", "").strip("'").strip('"')
+    cleaned = str(raw).replace("\n", "").replace("\r", "").strip("'").strip('"')
+    if strip_spaces:
+        cleaned = cleaned.replace(" ", "")
     if "=" in cleaned:
         cleaned = cleaned.split("=")[-1]
     return cleaned.strip()
+
+
+ADMIN_USER = get_clean_secret("ADMIN_USERNAME", strip_spaces=False).lower()
 
 
 # --- DATABASE (SQLITE) HELPERS ---
@@ -87,10 +113,25 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL
+            salt TEXT NOT NULL,
+            last_login TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            daily_count INTEGER NOT NULL DEFAULT 0,
+            daily_date TEXT NOT NULL DEFAULT ''
         )
         """
     )
+    for alter_sql in [
+        "ALTER TABLE users ADD COLUMN last_login TEXT",
+        "ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN daily_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN daily_date TEXT NOT NULL DEFAULT ''",
+    ]:
+        try:
+            cur.execute(alter_sql)
+        except sqlite3.OperationalError:
+            pass
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS user_chats (
@@ -108,6 +149,14 @@ def hash_password(password: str, salt: str) -> str:
     return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
 
 
+def now_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def register_user(username: str, password: str) -> tuple[bool, str]:
     clean_user = username.strip().lower()
     if len(clean_user) < 3:
@@ -117,13 +166,18 @@ def register_user(username: str, password: str) -> tuple[bool, str]:
 
     salt = os.urandom(16).hex()
     pw_hash = hash_password(password, salt)
+    ts = now_timestamp()
+    today = today_str()
 
     conn = get_conn()
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)",
-            (clean_user, pw_hash, salt),
+            """
+            INSERT INTO users (username, password_hash, salt, last_login, is_active, daily_count, daily_date)
+            VALUES (?, ?, ?, ?, 1, 0, ?)
+            """,
+            (clean_user, pw_hash, salt, ts, today),
         )
         default_sessions = [{"title": "Chat 1", "pinned": False, "messages": []}]
         cur.execute(
@@ -142,16 +196,128 @@ def authenticate_user(username: str, password: str) -> tuple[bool, str]:
     clean_user = username.strip().lower()
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT password_hash, salt FROM users WHERE username = ?", (clean_user,))
+    cur.execute(
+        "SELECT password_hash, salt, is_active FROM users WHERE username = ?",
+        (clean_user,),
+    )
     row = cur.fetchone()
-    conn.close()
 
     if not row:
+        conn.close()
         return False, "Account not found."
 
+    if int(row["is_active"] if row["is_active"] is not None else 1) == 0:
+        conn.close()
+        return False, "This account has been disabled by the administrator."
+
     if hash_password(password, row["salt"]) == row["password_hash"]:
+        cur.execute("UPDATE users SET last_login = ? WHERE username = ?", (now_timestamp(), clean_user))
+        conn.commit()
+        conn.close()
         return True, "Authenticated."
+
+    conn.close()
     return False, "Invalid password."
+
+
+def is_user_active(username: str) -> bool:
+    if not username or username == "dev_tester":
+        return True
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT is_active FROM users WHERE username = ?", (username.lower(),))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return True
+    return int(row["is_active"] if row["is_active"] is not None else 1) == 1
+
+
+def get_daily_usage(username: str) -> tuple[int, str]:
+    today = today_str()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT daily_count, daily_date FROM users WHERE username = ?", (username.lower(),))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return 0, today
+    saved_date = row["daily_date"] or today
+    count = int(row["daily_count"] or 0) if saved_date == today else 0
+    return count, today
+
+
+def check_and_consume_quota(username: str, is_owner_user: bool) -> tuple[bool, str]:
+    """Allow unlimited requests for owner; enforce DAILY_USER_LIMIT for standard users."""
+    if is_owner_user or username == "dev_tester":
+        return True, ""
+
+    if not is_user_active(username):
+        return False, "Your account is currently disabled."
+
+    count, today = get_daily_usage(username)
+    if count >= DAILY_USER_LIMIT:
+        return False, f"Daily limit reached ({DAILY_USER_LIMIT}/{DAILY_USER_LIMIT} messages for today). Try again tomorrow."
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE users
+        SET daily_count = ?, daily_date = ?
+        WHERE username = ?
+        """,
+        (count + 1, today, username.lower()),
+    )
+    conn.commit()
+    conn.close()
+    return True, ""
+
+
+def set_user_active_status(username: str, active: bool):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET is_active = ? WHERE username = ?",
+        (1 if active else 0, username.lower()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def count_user_total_messages(username: str) -> int:
+    sessions, _ = load_user_chats(username)
+    total = 0
+    for s in sessions:
+        total += len(s.get("messages", []))
+    return total
+
+
+def get_all_users_admin() -> list[dict]:
+    """Fetch all registered users with login, status, daily usage, and total messages (admin only)."""
+    today = today_str()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT username, last_login, is_active, daily_count, daily_date FROM users ORDER BY last_login DESC, id DESC"
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    results = []
+    for r in rows:
+        uname = r["username"]
+        active_flag = int(r["is_active"] if r["is_active"] is not None else 1) == 1
+        d_count = int(r["daily_count"] or 0) if (r["daily_date"] == today) else 0
+        results.append({
+            "username": uname,
+            "status": "Active" if active_flag else "Disabled",
+            "is_active": active_flag,
+            "today_msgs": f"{d_count}/{DAILY_USER_LIMIT}",
+            "total_msgs": count_user_total_messages(uname),
+            "last_login": r["last_login"] or "Never",
+        })
+    return results
 
 
 def serialize_sessions(sessions: list) -> list:
@@ -265,6 +431,14 @@ if "renaming_idx" not in st.session_state:
     st.session_state.renaming_idx = None
 if "show_restore" not in st.session_state:
     st.session_state.show_restore = False
+if "admin_mode" not in st.session_state:
+    st.session_state.admin_mode = False
+if "study_mode" not in st.session_state:
+    st.session_state.study_mode = "Friendly & Deep"
+if "chat_search_query" not in st.session_state:
+    st.session_state.chat_search_query = ""
+if "trigger_regenerate" not in st.session_state:
+    st.session_state.trigger_regenerate = False
 
 # --- DEV QUERY-PARAM BYPASS (?dev=1) ---
 if not st.session_state.auth_user and st.query_params.get("dev") == "1":
@@ -298,6 +472,7 @@ if not st.session_state.auth_user:
             if ok:
                 clean_u = in_user.strip().lower()
                 st.session_state.auth_user = clean_u
+                st.session_state.admin_mode = False
                 loaded_s, loaded_i = load_user_chats(clean_u)
                 st.session_state.sessions = loaded_s
                 st.session_state.current_session_idx = loaded_i
@@ -310,13 +485,15 @@ if not st.session_state.auth_user:
         with st.form("register_form", border=False):
             up_user = st.text_input("Username", key="start_reg_user")
             up_pass = st.text_input("Password", type="password", key="start_reg_pass")
-            st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+            st.caption("By registering, you agree that chats may be reviewed by the app owner for moderation and quality.")
+            st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
             submitted_up = st.form_submit_button(":material/person_add:", use_container_width=True, type="primary")
         if submitted_up:
             ok, msg = register_user(up_user, up_pass)
             if ok:
                 clean_u = up_user.strip().lower()
                 st.session_state.auth_user = clean_u
+                st.session_state.admin_mode = False
                 st.session_state.sessions = [{"title": "Chat 1", "pinned": False, "messages": []}]
                 st.session_state.current_session_idx = 0
                 st.rerun()
@@ -325,14 +502,36 @@ if not st.session_state.auth_user:
 
     st.stop()
 
-# --- 1. SIDEBAR (UNCLUTTERED CONTROLS + SAVED CHATS AT BOTTOM) ---
+is_owner = bool(ADMIN_USER) and (st.session_state.auth_user == ADMIN_USER)
+
+if not is_owner and not is_user_active(st.session_state.auth_user):
+    st.error("Your account has been disabled by the administrator.")
+    if st.button(":material/logout: Sign Out"):
+        st.session_state.auth_user = None
+        st.rerun()
+    st.stop()
+
+# --- 1. SIDEBAR ---
 st.sidebar.title(":material/bolt: SQOODS PRIME")
-st.sidebar.caption(f":material/account_circle: {st.session_state.auth_user}")
+st.sidebar.caption(f":material/account_circle: {st.session_state.auth_user}" + (" (Owner)" if is_owner else ""))
+
+if not is_owner and st.session_state.auth_user != "dev_tester":
+    used_today, _ = get_daily_usage(st.session_state.auth_user)
+    st.sidebar.caption(f":material/bolt: Today's limit: {used_today}/{DAILY_USER_LIMIT}")
+
 st.sidebar.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+
+if is_owner:
+    admin_btn_label = ":material/chat: Back to My Chat" if st.session_state.admin_mode else ":material/admin_panel_settings: Admin Users & Chats"
+    if st.sidebar.button(admin_btn_label, use_container_width=True, type="primary" if not st.session_state.admin_mode else "secondary"):
+        st.session_state.admin_mode = not st.session_state.admin_mode
+        st.rerun()
+    st.sidebar.markdown("<div style='height: 6px;'></div>", unsafe_allow_html=True)
 
 top_s1, top_s2 = st.sidebar.columns(2, gap="small")
 with top_s1:
     if st.button(":material/add:", use_container_width=True, help="New Chat"):
+        st.session_state.admin_mode = False
         st.session_state.sessions.append({"title": f"Chat {len(st.session_state.sessions) + 1}", "pinned": False, "messages": []})
         st.session_state.current_session_idx = len(st.session_state.sessions) - 1
         st.session_state.sessions, st.session_state.current_session_idx = sort_sessions_keep_active(
@@ -349,6 +548,7 @@ with top_s2:
             st.session_state.current_session_idx,
         )
         st.session_state.auth_user = None
+        st.session_state.admin_mode = False
         st.session_state.sessions = [{"title": "Chat 1", "pinned": False, "messages": []}]
         st.session_state.current_session_idx = 0
         st.session_state.renaming_idx = None
@@ -401,8 +601,30 @@ if st.session_state.show_restore:
 
 st.sidebar.divider()
 
-for idx, session in enumerate(st.session_state.sessions):
-    is_active = idx == st.session_state.current_session_idx
+st.sidebar.text_input(
+    "Search chats",
+    placeholder="Filter chats...",
+    key="chat_search_query",
+    label_visibility="collapsed",
+)
+search_term = st.session_state.chat_search_query.strip().lower()
+
+visible_indices = []
+for real_idx, s in enumerate(st.session_state.sessions):
+    if not search_term:
+        visible_indices.append(real_idx)
+    else:
+        title_match = search_term in (s.get("title") or "").lower()
+        body_match = any(search_term in (m.get("content") or "").lower() for m in s.get("messages", []))
+        if title_match or body_match:
+            visible_indices.append(real_idx)
+
+if not visible_indices:
+    st.sidebar.caption("No matching chats found.")
+
+for idx in visible_indices:
+    session = st.session_state.sessions[idx]
+    is_active = (idx == st.session_state.current_session_idx) and not st.session_state.admin_mode
     is_pinned = bool(session.get("pinned", False))
 
     if st.session_state.renaming_idx == idx:
@@ -427,6 +649,7 @@ for idx, session in enumerate(st.session_state.sessions):
         lead_icon = ":material/keep:" if is_pinned else (":material/chat:" if is_active else ":material/chat_bubble_outline:")
         with c_main:
             if st.button(f"{lead_icon} {session['title']}", key=f"chat_btn_{idx}", use_container_width=True):
+                st.session_state.admin_mode = False
                 st.session_state.current_session_idx = idx
                 save_user_chats(st.session_state.auth_user, st.session_state.sessions, st.session_state.current_session_idx)
                 st.rerun()
@@ -459,8 +682,89 @@ for idx, session in enumerate(st.session_state.sessions):
                     save_user_chats(st.session_state.auth_user, st.session_state.sessions, st.session_state.current_session_idx)
                     st.rerun()
 
+
+def build_notes_markdown(session_data: dict, owner_label: str = "SQOODS PRIME") -> str:
+    """Format a chat session as downloadable Markdown notes."""
+    lines = [f"# {session_data['title']} — {owner_label}\n"]
+    for msg in session_data["messages"]:
+        who = "User" if msg["role"] == "user" else "SQOODS PRIME"
+        lines.append(f"### {who}\n{msg.get('content', '')}\n")
+    return "\n".join(lines)
+
+
+# --- OWNER-ONLY ADMIN DASHBOARD VIEW ---
+if is_owner and st.session_state.admin_mode:
+    st.title(":material/admin_panel_settings: Owner Activity Monitor")
+    st.caption("Private view — visible only to your admin account.")
+
+    all_users = get_all_users_admin()
+    if not all_users:
+        st.info("No registered users yet.")
+        st.stop()
+
+    st.subheader(f"Registered Users ({len(all_users)})")
+    table_rows = [
+        {
+            "username": u["username"],
+            "status": u["status"],
+            "today_msgs": u["today_msgs"],
+            "total_msgs": u["total_msgs"],
+            "last_login": u["last_login"],
+        }
+        for u in all_users
+    ]
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Manage Account & Inspect Chats")
+    user_names = [u["username"] for u in all_users]
+    selected_target = st.selectbox("Select user", user_names)
+
+    if selected_target:
+        target_info = next((u for u in all_users if u["username"] == selected_target), None)
+        if selected_target != ADMIN_USER and target_info:
+            if target_info["is_active"]:
+                if st.button(":material/block: Disable User Account", key="disable_user_btn"):
+                    set_user_active_status(selected_target, False)
+                    st.rerun()
+            else:
+                if st.button(":material/check_circle: Enable User Account", key="enable_user_btn", type="primary"):
+                    set_user_active_status(selected_target, True)
+                    st.rerun()
+
+        target_sessions, _ = load_user_chats(selected_target)
+        session_titles = [f"{idx + 1}. {s['title']} ({len(s.get('messages', []))} msgs)" for idx, s in enumerate(target_sessions)]
+        chosen_s_label = st.selectbox("Select chat session", session_titles)
+        chosen_s_idx = session_titles.index(chosen_s_label)
+        chosen_session = target_sessions[chosen_s_idx]
+        chosen_msgs = chosen_session.get("messages", [])
+
+        if chosen_msgs:
+            st.download_button(
+                label=":material/download: Export User Chat (.md)",
+                data=build_notes_markdown(chosen_session, owner_label=f"User: {selected_target}"),
+                file_name=f"{selected_target}_chat_{chosen_s_idx + 1}.md",
+                mime="text/markdown",
+            )
+
+        if not chosen_msgs:
+            st.info("This chat session is empty.")
+        else:
+            for msg in chosen_msgs:
+                with st.chat_message(msg["role"]):
+                    if msg.get("images"):
+                        valid_imgs = [img for img in msg["images"] if img.get("bytes")]
+                        if valid_imgs:
+                            cols = st.columns(min(len(valid_imgs), 3), gap="medium")
+                            for j, img_data in enumerate(valid_imgs):
+                                with cols[j % len(cols)]:
+                                    st.image(img_data["bytes"], use_container_width=True)
+                    if msg.get("content"):
+                        st.markdown(msg["content"])
+    st.stop()
+
 # --- 2. API KEY SETUP ---
-api_key = get_clean_secret("GEMINI_API_KEY")
+api_key = get_clean_secret("GEMINI_API_KEY", strip_spaces=True)
 
 if not api_key:
     st.error("GEMINI_API_KEY missing in Streamlit Secrets.")
@@ -469,13 +773,18 @@ if not api_key:
 client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
 MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-3.5-flash-lite"]
 
-SYSTEM_PROMPT = """
-You are SQOODS PRIME, an intelligent AI assistant developed by Anish Shaikh.
-- If asked your name, state you are SQOODS PRIME.
-- If asked who created you, credit Anish Shaikh.
-- Give clear, accurate, and well-structured technical, academic, and general answers.
-- When users attach images, inspect them directly and explain clearly without disclaimers about lacking eyes or needing OCR.
+BASE_SYSTEM_PROMPT = """
+You are SQOODS PRIME, an intelligent, warm, and deeply thoughtful AI assistant created by Anish Shaikh.
+- Identity: If asked your name, state you are SQOODS PRIME. If asked who created you, credit Anish Shaikh.
+- Tone & Friendliness: Always communicate in a friendly, encouraging, approachable, and respectful tone—like a smart, supportive study partner and mentor.
+- Scientific & Academic Depth: When asked complex, technical, or professor-level questions, think deeply step-by-step and give accurate, clear explanations with intuition, mechanisms, and formulas where helpful.
+- Vision & Images: When users attach images, diagrams, or handwritten problems, inspect them carefully and explain every step clearly without disclaimers about lacking eyes or needing OCR.
 """
+
+
+def get_effective_system_prompt(mode_name: str) -> str:
+    mode_directive = STUDY_MODES.get(mode_name, STUDY_MODES["Friendly & Deep"])
+    return f"{BASE_SYSTEM_PROMPT}\n- Current Response Mode ({mode_name}): {mode_directive}"
 
 
 def prepare_image_part(img_item: dict) -> types.Part:
@@ -552,17 +861,22 @@ def build_token_efficient_contents(messages: list, effective_prompt: str) -> lis
     return gemini_contents
 
 
-def generate_with_resilience(contents_payload, enable_search: bool = True, max_retries: int = 3):
-    """Retry 429 rate limits with backoff+jitter and fall back across models on 503 spikes."""
+def generate_with_resilience(contents_payload, enable_search: bool = True, mode_name: str = "Friendly & Deep", max_retries: int = 3):
+    """Use deeper thinking on primary model, with backoff+jitter on 429 and fallback on 503."""
     base_delay = 2
     tools = [{"google_search": {}}] if enable_search else None
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        tools=tools,
-    )
+    sys_prompt = get_effective_system_prompt(mode_name)
+    budget = 20480 if mode_name == "Professor Rigor" else 16384
 
     last_error = None
     for model_name in MODEL_CANDIDATES:
+        use_deep_thinking = "2.5" in model_name
+        config = types.GenerateContentConfig(
+            system_instruction=sys_prompt,
+            tools=tools,
+            temperature=0.65,
+            thinking_config=types.ThinkingConfig(thinking_budget=budget) if use_deep_thinking else None,
+        )
         for attempt in range(max_retries):
             try:
                 return client.models.generate_content(
@@ -597,16 +911,7 @@ def generate_with_resilience(contents_payload, enable_search: bool = True, max_r
     raise last_error
 
 
-def build_notes_markdown(session_data: dict) -> str:
-    """Format active chat history as downloadable Markdown notes."""
-    lines = [f"# {session_data['title']} — SQOODS PRIME\n"]
-    for msg in session_data["messages"]:
-        who = "User" if msg["role"] == "user" else "SQOODS PRIME"
-        lines.append(f"### {who}\n{msg.get('content', '')}\n")
-    return "\n".join(lines)
-
-
-# --- 3. SPACIOUS HEADER WITH ICON-ONLY SEARCH TOGGLE IN TOP RIGHT ---
+# --- 3. SPACIOUS HEADER WITH STUDY MODE, SEARCH TOGGLE & EXPORT ---
 title_col, search_col, dl_col = st.columns([5.8, 1.1, 0.85], gap="medium", vertical_alignment="center")
 with title_col:
     st.title(":material/bolt: SQOODS PRIME")
@@ -631,6 +936,14 @@ with dl_col:
             help="Export Notes",
             use_container_width=True,
         )
+
+st.selectbox(
+    "Study Mode",
+    list(STUDY_MODES.keys()),
+    key="study_mode",
+    label_visibility="collapsed",
+    help="Choose explanation depth and teaching style",
+)
 
 st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
@@ -698,6 +1011,15 @@ for i, message in enumerate(messages):
                 const svgCopy_{i} = {json.dumps(SVG_COPY)};
                 const svgCheck_{i} = {json.dumps(SVG_CHECK)};
 
+                function cleanSpeechText(raw) {{
+                    return raw
+                        .replace(/```[\\s\\S]*?```/g, " ")
+                        .replace(/`([^`]+)`/g, "$1")
+                        .replace(/[#*_~>\\-]+/g, " ")
+                        .replace(/\\s+/g, " ")
+                        .trim();
+                }}
+
                 function copyText_{i}() {{
                     navigator.clipboard.writeText(msgText_{i}).then(() => {{
                         const btn = document.getElementById("copy-btn-{i}");
@@ -717,13 +1039,40 @@ for i, message in enumerate(messages):
                 }}
 
                 function speakText_{i}() {{
+                    if (!("speechSynthesis" in window)) return;
                     window.speechSynthesis.cancel();
-                    const utterance = new SpeechSynthesisUtterance(msgText_{i});
-                    window.speechSynthesis.speak(utterance);
+
+                    const cleaned = cleanSpeechText(msgText_{i});
+                    if (!cleaned) return;
+
+                    const chunks = cleaned.match(/[^.!?]+[.!?]*|[^.!?]+$/g) || [cleaned];
+                    let idx = 0;
+
+                    function playNext() {{
+                        if (idx >= chunks.length) return;
+                        const part = chunks[idx++].trim();
+                        if (!part) {{
+                            playNext();
+                            return;
+                        }}
+                        const utterance = new SpeechSynthesisUtterance(part);
+                        utterance.lang = "en-IN";
+                        utterance.rate = 1.0;
+                        utterance.onend = playNext;
+                        utterance.onerror = playNext;
+                        window.speechSynthesis.speak(utterance);
+                    }}
+
+                    setTimeout(playNext, 60);
                 }}
             </script>
             """
             components.html(toolbar_html, height=46)
+
+            if i == len(messages) - 1:
+                if st.button(":material/refresh: Regenerate", key=f"regen_btn_{i}"):
+                    st.session_state.trigger_regenerate = True
+                    st.rerun()
 
 voice_html = f"""
 <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px; font-family:sans-serif;">
@@ -798,6 +1147,49 @@ voice_html = f"""
 """
 components.html(voice_html, height=44)
 
+if st.session_state.trigger_regenerate:
+    st.session_state.trigger_regenerate = False
+    if messages and messages[-1]["role"] == "assistant":
+        allowed, limit_msg = check_and_consume_quota(st.session_state.auth_user, is_owner)
+        if not allowed:
+            st.warning(limit_msg)
+        else:
+            messages.pop()
+            last_user_text = ""
+            for m in reversed(messages):
+                if m["role"] == "user":
+                    last_user_text = m.get("content") or "Examine the attached images carefully and explain or solve the content clearly."
+                    break
+            with st.chat_message("assistant"):
+                with st.spinner("Regenerating..."):
+                    try:
+                        gemini_contents = build_token_efficient_contents(messages, last_user_text)
+                        response = generate_with_resilience(
+                            gemini_contents,
+                            enable_search=use_search,
+                            mode_name=st.session_state.study_mode,
+                        )
+                        bot_reply = response.text
+                        st.markdown(bot_reply)
+                        messages.append({"role": "assistant", "content": bot_reply})
+                        save_user_chats(
+                            st.session_state.auth_user,
+                            st.session_state.sessions,
+                            st.session_state.current_session_idx,
+                        )
+                        st.rerun()
+                    except APIError as e:
+                        if e.code == 429:
+                            st.warning("Rate limit reached. Try again shortly.")
+                        else:
+                            st.error(f"Error: {e}")
+                    except Exception as e:
+                        err_text = str(e)
+                        if "429" in err_text or "RESOURCE_EXHAUSTED" in err_text:
+                            st.warning("Rate limit reached. Try again shortly.")
+                        else:
+                            st.error(f"Error: {e}")
+
 chat_payload = st.chat_input(
     "Message SQOODS PRIME...",
     accept_file="multiple",
@@ -809,6 +1201,11 @@ raw_text = (chat_payload.text or "").strip() if chat_payload else ""
 uploaded_files = list(chat_payload.files or []) if chat_payload else []
 
 if raw_text or uploaded_files:
+    allowed, limit_msg = check_and_consume_quota(st.session_state.auth_user, is_owner)
+    if not allowed:
+        st.warning(limit_msg)
+        st.stop()
+
     stored_images = []
     for f in uploaded_files:
         stored_images.append({
@@ -843,10 +1240,14 @@ if raw_text or uploaded_files:
         st.markdown(display_text)
 
     with st.chat_message("assistant"):
-        with st.spinner("Processing..."):
+        with st.spinner("Thinking deeply..."):
             try:
                 gemini_contents = build_token_efficient_contents(messages, effective_prompt)
-                response = generate_with_resilience(gemini_contents, enable_search=use_search)
+                response = generate_with_resilience(
+                    gemini_contents,
+                    enable_search=use_search,
+                    mode_name=st.session_state.study_mode,
+                )
                 bot_reply = response.text
                 st.markdown(bot_reply)
                 messages.append({"role": "assistant", "content": bot_reply})
