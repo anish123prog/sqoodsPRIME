@@ -96,6 +96,7 @@ def get_clean_secret(name: str, strip_spaces: bool = True) -> str:
 
 ADMIN_USER = get_clean_secret("ADMIN_USERNAME", strip_spaces=False).lower()
 ADMIN_PASS = get_clean_secret("ADMIN_PASSWORD", strip_spaces=False)
+OWNER_KEY = get_clean_secret("OWNER_KEY", strip_spaces=False)
 
 
 # --- DATABASE (SQLITE) HELPERS ---
@@ -476,6 +477,19 @@ if "chat_search_query" not in st.session_state:
     st.session_state.chat_search_query = ""
 if "trigger_regenerate" not in st.session_state:
     st.session_state.trigger_regenerate = False
+
+# --- OWNER SECRET URL SHORTCUT (?owner=YOUR_OWNER_KEY) ---
+if not st.session_state.auth_user and OWNER_KEY and ADMIN_USER:
+    provided_owner_key = str(st.query_params.get("owner", "")).strip()
+    if provided_owner_key and provided_owner_key == OWNER_KEY:
+        ensure_owner_account()
+        st.session_state.auth_user = ADMIN_USER
+        st.session_state.admin_mode = False
+        loaded_s, loaded_i = load_user_chats(ADMIN_USER)
+        st.session_state.sessions = loaded_s
+        st.session_state.current_session_idx = loaded_i
+        st.query_params.clear()
+        st.rerun()
 
 # --- DEV QUERY-PARAM BYPASS (?dev=1) ---
 if not st.session_state.auth_user and st.query_params.get("dev") == "1":
