@@ -95,6 +95,7 @@ def get_clean_secret(name: str, strip_spaces: bool = True) -> str:
 
 
 ADMIN_USER = get_clean_secret("ADMIN_USERNAME", strip_spaces=False).lower()
+ADMIN_PASS = get_clean_secret("ADMIN_PASSWORD", strip_spaces=False)
 
 
 # --- DATABASE (SQLITE) HELPERS ---
@@ -155,6 +156,41 @@ def now_timestamp() -> str:
 
 def today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def ensure_owner_account():
+    """Auto-create or sync the owner account from Streamlit Secrets on startup."""
+    if not ADMIN_USER or not ADMIN_PASS:
+        return
+    salt = os.urandom(16).hex()
+    pw_hash = hash_password(ADMIN_PASS, salt)
+    ts = now_timestamp()
+    today = today_str()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE username = ?", (ADMIN_USER,))
+    exists = cur.fetchone()
+    if exists:
+        cur.execute(
+            "UPDATE users SET password_hash = ?, salt = ?, is_active = 1 WHERE username = ?",
+            (pw_hash, salt, ADMIN_USER),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO users (username, password_hash, salt, last_login, is_active, daily_count, daily_date)
+            VALUES (?, ?, ?, ?, 1, 0, ?)
+            """,
+            (ADMIN_USER, pw_hash, salt, ts, today),
+        )
+        default_sessions = [{"title": "Chat 1", "pinned": False, "messages": []}]
+        cur.execute(
+            "INSERT OR IGNORE INTO user_chats (username, sessions_json, current_idx) VALUES (?, ?, 0)",
+            (ADMIN_USER, json.dumps(default_sessions)),
+        )
+    conn.commit()
+    conn.close()
 
 
 def register_user(username: str, password: str) -> tuple[bool, str]:
@@ -417,6 +453,7 @@ def sort_sessions_keep_active(sessions: list, active_idx: int) -> tuple[list, in
 
 
 init_db()
+ensure_owner_account()
 
 # --- SESSION STATE INITIALIZATION ---
 if "auth_user" not in st.session_state:
